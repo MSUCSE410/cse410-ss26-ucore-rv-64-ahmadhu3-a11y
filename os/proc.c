@@ -3,6 +3,7 @@
 #include "loader.h"
 #include "trap.h"
 #include "vm.h"
+#include "timer.h"
 
 struct proc pool[NPROC];
 __attribute__((aligned(16))) char kstack[NPROC][PAGE_SIZE];
@@ -22,7 +23,7 @@ struct proc *curr_proc()
 	return current_proc;
 }
 
-// initialize the proc table at boot time.
+// Initialize the proc table at boot time.
 void proc_init(void)
 {
 	struct proc *p;
@@ -30,9 +31,12 @@ void proc_init(void)
 		p->state = UNUSED;
 		p->kstack = (uint64)kstack[p - pool];
 		p->trapframe = (struct trapframe *)trapframe[p - pool];
-		/*
-		* LAB1: you may need to initialize your new fields of proc here
-		*/
+
+		// Clear syscall counts and start time so there is no garbage data
+		for (int i = 0; i < MAX_SYSCALL_NUM; i++) {
+			p->syscall_times[i] = 0;
+		}
+		p->start_time = 0;
 	}
 	idle.kstack = (uint64)boot_stack_top;
 	idle.pid = 0;
@@ -47,7 +51,6 @@ int allocpid()
 
 // Look in the process table for an UNUSED proc.
 // If found, initialize state required to run in the kernel.
-// If there are no free procs, or a memory allocation fails, return 0.
 struct proc *allocproc(void)
 {
 	struct proc *p;
@@ -57,7 +60,6 @@ struct proc *allocproc(void)
 		}
 	}
 	return 0;
-
 found:
 	p->pid = allocpid();
 	p->state = USED;
@@ -72,20 +74,16 @@ found:
 	return p;
 }
 
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
 void scheduler(void)
 {
 	struct proc *p;
 	for (;;) {
 		for (p = pool; p < &pool[NPROC]; p++) {
 			if (p->state == RUNNABLE) {
-				/*
-				* LAB1: you may need to init proc start time here
-				*/
+				// Record the cycle when this process first gets the CPU
+				if (p->start_time == 0) {
+					p->start_time = get_cycle();
+				}
 				p->state = RUNNING;
 				current_proc = p;
 				swtch(&idle.context, &p->context);
@@ -94,13 +92,6 @@ void scheduler(void)
 	}
 }
 
-// Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->noff, but that would
-// break in the few places where a lock is held but
-// there's no process.
 void sched(void)
 {
 	struct proc *p = curr_proc();
@@ -109,7 +100,6 @@ void sched(void)
 	swtch(&p->context, &idle.context);
 }
 
-// Give up the CPU for one scheduling round.
 void yield(void)
 {
 	current_proc->state = RUNNABLE;
@@ -119,10 +109,8 @@ void yield(void)
 void freeproc(struct proc *p)
 {
 	p->state = UNUSED;
-	// uvmfree(p->pagetable, p->max_page);
 }
 
-// Exit the current process.
 void exit(int code)
 {
 	struct proc *p = curr_proc();
