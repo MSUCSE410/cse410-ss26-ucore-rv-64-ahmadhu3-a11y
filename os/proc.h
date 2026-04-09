@@ -7,6 +7,7 @@
 
 #define NPROC (512)
 #define FD_BUFFER_SIZE (16)
+#define BIG_STRIDE 65536
 
 struct file;
 
@@ -44,6 +45,9 @@ struct proc {
 	uint64 max_page;
 	struct proc *parent; // Parent process
 	uint64 exit_code;
+	int stride;
+    int pass;
+    long long priority;
 	struct file *files[FD_BUFFER_SIZE];
 };
 
