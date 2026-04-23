@@ -5,7 +5,7 @@
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
-
+#include "stat.h"
 uint64 console_write(uint64 va, uint64 len)
 {
 	struct proc *p = curr_proc();
@@ -94,6 +94,89 @@ uint64 sys_gettimeofday(uint64 val, int _tz)
 	return 0;
 }
 
+uint64 sys_mmap(void *start, uint64 len, int port, int flag, int fd)
+{
+	// Length of zero means nothing to map, just return success
+	if (len == 0)
+		return 0;
+
+	uint64 start_addr = (uint64)start;
+
+	// The start address must land exactly on a page boundary
+	if (start_addr % PGSIZE != 0)
+		return -1;
+
+	// We refuse requests larger than 1 GiB
+	if (len > (1u << 30))
+		return -1;
+
+	// Only the bottom 3 bits of port are valid permission flags
+	if (port & ~0x7)
+		return -1;
+
+	// Mapping with no read, write, or execute permission makes no sense
+	if ((port & 0x7) == 0)
+		return -1;
+
+	// Round the end address up so we cover all requested bytes
+	uint64 end = PGROUNDUP(start_addr + len);
+	struct proc *p = curr_proc();
+
+	// Before allocating anything, make sure none of these pages are already in use
+	for (uint64 va = start_addr; va < end; va += PGSIZE) {
+		if (walkaddr(p->pagetable, va) != 0)
+			return -1;
+	}
+
+	/* The code in `ch3` will leads to memory bugs*/
+	// Convert the port permission bits into the flags the page table expects.
+	// We always include PTE_U so the user program can actually access the pages.
+	int perm = PTE_U;
+	if (port & 1) perm |= PTE_R;
+	if (port & 2) perm |= PTE_W;
+	if (port & 4) perm |= PTE_X;
+
+	// Allocate one physical page at a time and map each one into the page table
+	for (uint64 va = start_addr; va < end; va += PGSIZE) {
+		void *pa = kalloc();
+		if (!pa)
+			return -1;
+		memset(pa, 0, PGSIZE);  // zero it out before handing it to the user
+		if (mappages(p->pagetable, va, PGSIZE, (uint64)pa, perm) != 0) {
+			kfree(pa);
+			return -1;
+		}
+	}
+
+	// Update max_page so the kernel knows how far this process's memory extends
+	if (end / PGSIZE > p->max_page)
+		p->max_page = end / PGSIZE;
+	return 0;
+}
+uint64 sys_munmap(void *start, uint64 len)
+{
+	if (len == 0)
+		return 0;
+
+	uint64 start_addr = (uint64)start;
+
+	if (start_addr % PGSIZE != 0)
+		return -1;
+
+	uint64 end = PGROUNDUP(start_addr + len);
+	struct proc *p = curr_proc();
+
+	// Make sure every page in the range is actually mapped before we remove anything
+	for (uint64 va = start_addr; va < end; va += PGSIZE) {
+		if (walkaddr(p->pagetable, va) == 0)
+			return -1;
+	}
+
+	// Remove all the mappings and free the physical memory they were using
+	uvmunmap(p->pagetable, start_addr, (end - start_addr) / PGSIZE, 1);
+	return 0;
+}
+
 uint64 sys_getpid()
 {
 	return curr_proc()->pid;
@@ -145,13 +228,49 @@ uint64 sys_wait(int pid, uint64 va)
 uint64 sys_spawn(uint64 va)
 {
 	// TODO: your job is to complete the sys call
-	return -1;
+	struct proc *p = curr_proc();
+	char name[MAX_STR_LEN];
+	// copy program path from user space into kernel
+	copyinstr(p->pagetable, name, va, MAX_STR_LEN);
+
+	// look up the inode for the executable on the filesystem
+	struct inode *ip = namei(name);
+	if (ip == 0) return -1;
+
+	// allocate a fresh process control block
+	struct proc *child = allocproc();
+	if (child == 0) { iput(ip); return -1; }
+
+	// give the child stdin/stdout/stderr and record its parent
+	init_stdio(child);
+	child->parent = p;
+
+	// load the binary into the child's address space
+	if (bin_loader(ip, child) < 0) { iput(ip); return -1; }
+	iput(ip);
+
+	// pass the program name as argv[0]
+	char *argv[2] = { name, NULL };
+	child->trapframe->a0 = push_argv(child, argv);
+
+	// put the child on the run queue
+	add_task(child);
+	return child->pid;
 }
 
 uint64 sys_set_priority(long long prio)
 {
 	// TODO: your job is to complete the sys call
-	return -1;
+	// Priority must be 2 or more; 1 or less doesn't make sense for this formula
+    if (prio < 2)
+        return -1;
+
+    struct proc *p = curr_proc(); // get the current process
+    p->priority = prio;           // set its new priority
+    // Recalculate pass: higher priority = smaller pass = stride grows slowly = picked more often
+    p->pass = BIG_STRIDE / p->priority;
+
+    return prio; // return the new priority to confirm success
 }
 
 uint64 sys_openat(uint64 va, uint64 omode, uint64 _flags)
@@ -179,17 +298,87 @@ uint64 sys_close(int fd)
 
 int sys_fstat(int fd,uint64 stat){
 	//TODO: your job is to complete the syscall
-	return -1;
+	if (fd < 0 || fd >= FD_BUFFER_SIZE) return -1;
+	struct proc *p = curr_proc();
+	struct file *f = p->files[fd];
+	// fd must be valid and point to an actual inode, not stdio
+	if (f == NULL || f->type != FD_INODE) return -1;
+ 
+	struct inode *ip = f->ip;
+	ivalid(ip); // make sure the in-memory inode is loaded from disk
+ 
+	struct Stat st;
+	memset(&st, 0, sizeof(st));
+	st.dev   = ip->dev;    // which disk
+	st.ino   = ip->inum;   // inode number
+	st.nlink = ip->nlink;  // how many hard links exist
+	// translate internal type to the user-visible mode constant
+	st.mode  = (ip->type == T_DIR) ? DIR : FILE;
+ 
+	// copy the filled struct out to user space
+	if (copyout(p->pagetable, stat, (char *)&st, sizeof(st)) < 0)
+		return -1;
+	return 0;
 }
 
 int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint64 flags){
 	//TODO: your job is to complete the syscall
-	return -1;
+	struct proc *p = curr_proc();
+	char old[MAXPATH], lnew[MAXPATH];
+	copyinstr(p->pagetable, old,  oldpath, MAXPATH);
+	copyinstr(p->pagetable, lnew, newpath, MAXPATH);
+ 
+	// linking a file to itself is an error per the spec
+	if (strncmp(old, lnew, MAXPATH) == 0) return -1;
+ 
+	// find the inode oldpath points to
+	struct inode *ip = namei(old);
+	if (ip == 0) return -1;
+	ivalid(ip);
+ 
+	// add a new directory entry in root that maps lnew to the same inode
+	struct inode *dp = root_dir();
+	if (dirlink(dp, lnew, ip->inum) < 0) { iput(dp); iput(ip); return -1; }
+ 
+	// now two entries point here, so increment the link count
+	ip->nlink++;
+	iupdate(ip); // write updated nlink to disk
+ 
+	iput(dp);
+	iput(ip);
+	return 0;
 }
 
 int sys_unlinkat(int dirfd, uint64 name, uint64 flags){
 	//TODO: your job is to complete the syscall
-	return -1;
+	struct proc *p = curr_proc();
+	char path[MAXPATH];
+	copyinstr(p->pagetable, path, name, MAXPATH);
+ 
+	struct inode *dp = root_dir();
+	// get the inode so we can update its link count
+	struct inode *ip = dirlookup(dp, path, 0);
+	if (ip == 0) { iput(dp); return -1; }
+	ivalid(ip);
+ 
+	// decrement first, then remove the directory entry
+	ip->nlink--;
+	iupdate(ip);
+ 
+	// dirunlink zeros out the dirent slot; it does not touch nlink
+	if (dirunlink(dp, path) < 0) {
+		// shouldn't happen — restore nlink to keep fs consistent
+		ip->nlink++;
+		iupdate(ip);
+		iput(dp);
+		iput(ip);
+		return -1;
+	}
+ 
+	iput(dp);
+	// if nlink == 0 and ref drops to 0, iput frees all data blocks
+	iput(ip);
+	return 0;
 }
 
 extern char trap_page[];
@@ -247,6 +436,7 @@ void syscall()
 		break;
 	case SYS_unlinkat:
 	    ret = sys_unlinkat(args[0],args[1],args[2]);
+		break;
 	case SYS_spawn:
 		ret = sys_spawn(args[0]);
 		break;
